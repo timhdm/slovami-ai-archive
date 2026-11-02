@@ -148,18 +148,38 @@ class InterviewViewModel(app: Application) : AndroidViewModel(app) {
     private val _embeddingDownloadProgress = MutableStateFlow(0f)
     val embeddingDownloadProgress: StateFlow<Float> = _embeddingDownloadProgress.asStateFlow()
 
-    fun setEmbeddingModel(model: EmbeddingModel) {
-        if (_embeddingModel.value == model || _isReloadingEmbedding.value) return
+    private val _missingSavedEmbedding = MutableStateFlow<EmbeddingModel?>(null)
+    val missingSavedEmbedding: StateFlow<EmbeddingModel?> = _missingSavedEmbedding.asStateFlow()
+
+    private fun embeddingRegistryModel(model: EmbeddingModel) = when (model) {
+        EmbeddingModel.CAMPlus -> ModelRegistry.EMBEDDING_CAMPLUS
+        EmbeddingModel.ERes2Net -> ModelRegistry.EMBEDDING_V1
+        EmbeddingModel.ERes2NetV2 -> ModelRegistry.EMBEDDING_V2
+    }
+
+    fun downloadSavedEmbedding() {
+        val missing = _missingSavedEmbedding.value ?: return
+        activateEmbedding(missing, force = true)
+    }
+
+    fun useCamPlusInstead() {
+        if (_isReloadingEmbedding.value) return
+        _missingSavedEmbedding.value = null
+        _embeddingModel.value = EmbeddingModel.CAMPlus
+        saveEmbeddingPref(EmbeddingModel.CAMPlus)
+        activateEmbedding(EmbeddingModel.CAMPlus, force = true)
+    }
+
+    fun setEmbeddingModel(model: EmbeddingModel) = activateEmbedding(model)
+
+    private fun activateEmbedding(model: EmbeddingModel, force: Boolean = false) {
+        if ((!force && _embeddingModel.value == model) || _isReloadingEmbedding.value) return
         viewModelScope.launch {
             _isReloadingEmbedding.value = true
             _embeddingDownloadProgress.value = 0f
             try {
                 val storage = ModelStorage(getApplication())
-                val registryModel = when (model) {
-                    EmbeddingModel.CAMPlus -> ModelRegistry.EMBEDDING_CAMPLUS
-                    EmbeddingModel.ERes2Net -> ModelRegistry.EMBEDDING_V1
-                    EmbeddingModel.ERes2NetV2 -> ModelRegistry.EMBEDDING_V2
-                }
+                val registryModel = embeddingRegistryModel(model)
                 if (!withContext(Dispatchers.IO) { storage.isValid(registryModel) }) {
                     val downloader = ModelDownloader(storage)
                     val progressJob = launch {
@@ -183,6 +203,7 @@ class InterviewViewModel(app: Application) : AndroidViewModel(app) {
                 if (ready) {
                     _embeddingModel.value = model
                     saveEmbeddingPref(model)
+                    _missingSavedEmbedding.value = null
                     _embeddingDownloadProgress.value = 1f
                 } else {
                     _toast.value = asr.errorMessage.value ?: "Не удалось загрузить модель"
@@ -326,7 +347,16 @@ class InterviewViewModel(app: Application) : AndroidViewModel(app) {
 
     fun preloadAsrModels() {
         viewModelScope.launch {
-            asr.initialize(_embeddingModel.value)
+            val selected = _embeddingModel.value
+            val storage = ModelStorage(getApplication())
+            val available = withContext(Dispatchers.IO) {
+                storage.isValid(embeddingRegistryModel(selected))
+            }
+            if (!available) {
+                _missingSavedEmbedding.value = selected
+                return@launch
+            }
+            if (!_isReloadingEmbedding.value) asr.initialize(selected)
         }
     }
 
