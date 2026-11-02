@@ -297,17 +297,9 @@ class AsrService(private val ctx: Context) {
             _state.value = State.DIARIZING
             _statusText.value = ctx.getString(R.string.asr_status_diarizing)
             val diarT0 = System.currentTimeMillis()
-            // ВАЖНО: callback передаём как function reference (::diarizationCallback),
-            // НЕ как лямбду. Sherpa-onnx 1.13.0 JNI ищет метод с сигнатурой
-            // Function3<Integer,Integer,Long,Integer> (boxed Integer возврат).
-            // Inline-лямбда `{ ... 0 }` компилируется в SAM с примитивным int →
-            // JNI NoSuchMethodError → SIGABRT (см. crash 30.04.2026).
-            // Named member function генерирует правильный bridge с java.lang.Integer.
-            val diarSegments = diarReady.processWithCallback(
-                samples = samples,
-                callback = ::diarizationCallback,
-                arg = 0L,
-            )
+            // Диагностика SIGSEGV ERes2Net: используем JNI process без callback.
+            // Остальную обработку не меняем, чтобы изолировать причину падения.
+            val diarSegments = diarReady.process(samples)
             Log.i(TAG, "Diarization done: ${diarSegments.size} segments, " +
                     "speakers: ${diarSegments.map { it.speaker }.distinct().sorted()}")
             val diarMs = System.currentTimeMillis() - diarT0
@@ -603,11 +595,7 @@ class AsrService(private val ctx: Context) {
         }
         try {
             val diarReady = applyClusteringConfig(diar, speakerMode)
-            val segs = diarReady.processWithCallback(
-                samples = samples,
-                callback = ::diarizationCallback,
-                arg = 0L,
-            )
+            val segs = diarReady.process(samples)
             segs.map { DiarizationSegment(it.start, it.end, it.speaker) }
         } catch (e: Throwable) {
             Log.e(TAG, "diarizeOnly failed", e)
