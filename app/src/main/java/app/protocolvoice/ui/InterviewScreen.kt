@@ -54,6 +54,7 @@ import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -154,6 +155,9 @@ fun InterviewScreen(
     val participants by vm.participants.collectAsStateWithLifecycle()
     val toast by vm.toast.collectAsStateWithLifecycle()
     val recognitionError by vm.recognitionError.collectAsStateWithLifecycle()
+    val missingSavedEmbedding by vm.missingSavedEmbedding.collectAsStateWithLifecycle()
+    val isReloadingSavedEmbedding by vm.isReloadingEmbedding.collectAsStateWithLifecycle()
+    val savedEmbeddingProgress by vm.embeddingDownloadProgress.collectAsStateWithLifecycle()
     val exportedUri by vm.exportedDocx.collectAsStateWithLifecycle()
     val summaryResult by vm.summaryResult.collectAsStateWithLifecycle()
     val isGeneratingSummary by vm.isGeneratingSummary.collectAsStateWithLifecycle()
@@ -220,6 +224,38 @@ fun InterviewScreen(
             snack.showSnackbar(it)
             vm.consumeToast()
         }
+    }
+
+    if (missingSavedEmbedding != null) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Модель не загружена") },
+            text = {
+                Column {
+                    Text("Сохранённая модель ${missingSavedEmbedding!!.name} отсутствует. Скачайте её или используйте CAM++.")
+                    if (isReloadingSavedEmbedding) {
+                        Spacer(Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = { savedEmbeddingProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text("Загрузка: ${(savedEmbeddingProgress * 100).toInt()}%")
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isReloadingSavedEmbedding,
+                    onClick = { vm.downloadSavedEmbedding() },
+                ) { Text("Скачать модель") }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    enabled = !isReloadingSavedEmbedding,
+                    onClick = { vm.useCamPlusInstead() },
+                ) { Text("Использовать CAM++") }
+            },
+        )
     }
 
     Scaffold(
