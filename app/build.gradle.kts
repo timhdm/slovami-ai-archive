@@ -23,6 +23,15 @@ android {
         }
     }
 
+    signingConfigs {
+        create("ciDebug") {
+            storeFile = file(System.getenv("DEBUG_KEYSTORE_PATH") ?: "missing-debug-keystore.jks")
+            storePassword = System.getenv("DEBUG_KEYSTORE_PASSWORD")
+            keyAlias = "protocolvoice-debug"
+            keyPassword = System.getenv("DEBUG_KEY_PASSWORD")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -31,6 +40,9 @@ android {
             isDebuggable = true
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
+            if (System.getenv("DEBUG_KEYSTORE_PATH") != null) {
+                signingConfig = signingConfigs.getByName("ciDebug")
+            }
         }
     }
 
