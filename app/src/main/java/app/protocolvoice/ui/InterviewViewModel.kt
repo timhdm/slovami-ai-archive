@@ -145,16 +145,61 @@ class InterviewViewModel(app: Application) : AndroidViewModel(app) {
     val isReloadingEmbedding: StateFlow<Boolean> = _isReloadingEmbedding.asStateFlow()
 
 
+    private val _embeddingDownloadProgress = MutableStateFlow(0f)
+    val embeddingDownloadProgress: StateFlow<Float> = _embeddingDownloadProgress.asStateFlow()
+
     fun setEmbeddingModel(model: EmbeddingModel) {
-        if (_embeddingModel.value == model) return
-        _embeddingModel.value = model
-        saveEmbeddingPref(model)
-        // Релоад в фоне — UI покажет индикатор через isReloadingEmbedding.
+        if (_embeddingModel.value == model || _isReloadingEmbedding.value) return
         viewModelScope.launch {
             _isReloadingEmbedding.value = true
-            asr.initialize(model)
-            _isReloadingEmbedding.value = false
+            _embeddingDownloadProgress.value = 0f
+            try {
+                val storage = ModelStorage(getApplication())
+                val registryModel = when (model) {
+                    EmbeddingModel.CAMPlus -> ModelRegistry.EMBEDDING_CAMPLUS
+                    EmbeddingModel.ERes2Net -> ModelRegistry.EMBEDDING_V1
+                    EmbeddingModel.ERes2NetV2 -> ModelRegistry.EMBEDDING_V2
+                }
+                if (!withContext(Dispatchers.IO) { storage.isValid(registryModel) }) {
+                    val downloader = ModelDownloader(storage)
+                    val progressJob = launch {
+                        downloader.bytesDownloaded.collect { bytes ->
+                            _embeddingDownloadProgress.value =
+                                (bytes.toFloat() / registryModel.sizeBytes).coerceIn(0f, 1f)
+                        }
+                    }
+                    val downloaded = try {
+                        downloader.downloadAll(listOf(registryModel))
+                    } finally {
+                        progressJob.cancel()
+                    }
+                    if (!downloaded) {
+                        _toast.value = "Не удалось скачать ${registryModel.filename}: " +
+                            (downloader.errorMessage.value ?: "проверьте подключение")
+                        return@launch
+                    }
+                }
+                val ready = asr.initialize(model)
+                if (ready) {
+                    _embeddingModel.value = model
+                    saveEmbeddingPref(model)
+                    _embeddingDownloadProgress.value = 1f
+                } else {
+                    _toast.value = asr.errorMessage.value ?: "Не удалось загрузить модель"
+                }
+            } catch (e: Exception) {
+                Log.e("InterviewVM", "Embedding model setup failed", e)
+                _toast.value = "Ошибка загрузки модели: ${e.message}"
+            } finally {
+                _isReloadingEmbedding.value = false
+            }
         }
+    }
+
+    fun retryRecognitionWithExistingAudio() {
+        if (_wavFile.value?.isFile != true || LongTaskRunner.recognitionInProgress.value) return
+        _recognitionError.value = null
+        _phase.value = Phase.RECORDED
     }
 
     private fun prefs() = getApplication<Application>()
