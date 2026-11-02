@@ -58,8 +58,8 @@ enum class EmbeddingModel(
     );
 
     companion object {
-        /** Дефолт при первом запуске. ERes2NetV2 — баланс скорости и качества. */
-        val DEFAULT = ERes2NetV2
+        /** Default to the embedding model installed during first-run onboarding. */
+        val DEFAULT = CAMPlus
 
         /** Все варианты в порядке для UI. */
         val all: List<EmbeddingModel>
