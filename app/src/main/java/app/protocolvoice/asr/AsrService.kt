@@ -160,6 +160,13 @@ class AsrService(private val ctx: Context) {
                 Log.i(TAG, "ASR recognizer initialized")
             }
 
+            // Do not pass a missing embedding model to native sherpa-onnx.
+            // The JNI constructor may return a null pointer without throwing.
+            val embeddingFile = File(AssetExtractor.Paths.embeddingFor(storage, embeddingModel))
+            check(embeddingFile.isFile && embeddingFile.length() > 0L) {
+                "Speaker embedding model is missing or empty: ${embeddingFile.name}. Download the selected model first."
+            }
+
             // === 2. Speaker Diarization ===
             // numClusters=-1 → автоопределение количества спикеров через threshold
             val diarConfig = OfflineSpeakerDiarizationConfig(
