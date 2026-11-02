@@ -156,6 +156,7 @@ fun InterviewScreen(
     val toast by vm.toast.collectAsStateWithLifecycle()
     val recognitionError by vm.recognitionError.collectAsStateWithLifecycle()
     val missingSavedEmbedding by vm.missingSavedEmbedding.collectAsStateWithLifecycle()
+    val pendingEmbeddingDownload by vm.pendingEmbeddingDownload.collectAsStateWithLifecycle()
     val isReloadingSavedEmbedding by vm.isReloadingEmbedding.collectAsStateWithLifecycle()
     val savedEmbeddingProgress by vm.embeddingDownloadProgress.collectAsStateWithLifecycle()
     val exportedUri by vm.exportedDocx.collectAsStateWithLifecycle()
@@ -224,6 +225,23 @@ fun InterviewScreen(
             snack.showSnackbar(it)
             vm.consumeToast()
         }
+    }
+
+    if (pendingEmbeddingDownload != null) {
+        val pending = pendingEmbeddingDownload!!
+        AlertDialog(
+            onDismissRequest = { vm.cancelEmbeddingDownload() },
+            title = { Text("Скачать модель?") },
+            text = {
+                Text("Для ${pending.name} требуется загрузить ${vm.embeddingDownloadSizeMb(pending)} МБ. Продолжить?")
+            },
+            confirmButton = {
+                Button(onClick = { vm.confirmEmbeddingDownload() }) { Text("Да, скачать") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { vm.cancelEmbeddingDownload() }) { Text("Нет") }
+            },
+        )
     }
 
     if (missingSavedEmbedding != null) {
