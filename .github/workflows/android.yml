@@ -21,7 +21,20 @@ jobs:
           curl --fail --location --retry 3 --output app/libs/sherpa-onnx.aar \
             "https://huggingface.co/csukuangfj2/sherpa-onnx-libs/resolve/main/android/aar/1.13.1/sherpa-onnx-static-link-onnxruntime-1.13.1.aar"
           echo "1cae99f3330e8da180cbf9d2e20c5257d4444d8713c4df4094a9471a2c11300b  app/libs/sherpa-onnx.aar" | sha256sum --check
-      - run: bash ./gradlew --no-daemon assembleDebug testDebugUnitTest
+      - name: Restore persistent debug signing key
+        shell: bash
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$DEBUG_KEYSTORE_BASE64"
+          printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/protocolvoice-debug.jks"
+          chmod 600 "$RUNNER_TEMP/protocolvoice-debug.jks"
+      - name: Build and test signed debug APK
+        env:
+          DEBUG_KEYSTORE_PATH: ${{ runner.temp }}/protocolvoice-debug.jks
+          DEBUG_KEYSTORE_PASSWORD: ${{ secrets.DEBUG_KEYSTORE_PASSWORD }}
+          DEBUG_KEY_PASSWORD: ${{ secrets.DEBUG_KEY_PASSWORD }}
+        run: bash ./gradlew --no-daemon assembleDebug testDebugUnitTest
       - name: Upload debug APK
         if: success()
         uses: actions/upload-artifact@v4
