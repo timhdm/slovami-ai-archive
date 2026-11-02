@@ -85,6 +85,9 @@ class InterviewViewModel(app: Application) : AndroidViewModel(app) {
     private val _phase = MutableStateFlow(Phase.IDLE)
     val phase: StateFlow<Phase> = _phase.asStateFlow()
 
+    private val _recognitionError = MutableStateFlow<String?>(null)
+    val recognitionError: StateFlow<String?> = _recognitionError.asStateFlow()
+
     private val _metadata = MutableStateFlow(InterviewMetadata())
     val metadata: StateFlow<InterviewMetadata> = _metadata.asStateFlow()
 
@@ -354,8 +357,14 @@ class InterviewViewModel(app: Application) : AndroidViewModel(app) {
                 if (r.error != null) {
                     Log.e("InterviewVM", "Recognition failed: ${r.error}")
                     _toast.value = r.error
+                    _recognitionError.value = if (r.error.contains("Speaker embedding model is missing or empty")) {
+                        "Выбранная модель разделения говорящих не загружена. Выберите CAM++ или загрузите нужную модель перед распознаванием."
+                    } else {
+                        r.error
+                    }
                     _phase.value = Phase.ERROR
                 } else {
+                    _recognitionError.value = null
                     val t = r.transcript as? app.protocolvoice.asr.InterviewTranscript
                     if (t == null) {
                         _phase.value = Phase.ERROR
