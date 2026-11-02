@@ -153,6 +153,7 @@ fun InterviewScreen(
     val metadata by vm.metadata.collectAsStateWithLifecycle()
     val participants by vm.participants.collectAsStateWithLifecycle()
     val toast by vm.toast.collectAsStateWithLifecycle()
+    val recognitionError by vm.recognitionError.collectAsStateWithLifecycle()
     val exportedUri by vm.exportedDocx.collectAsStateWithLifecycle()
     val summaryResult by vm.summaryResult.collectAsStateWithLifecycle()
     val isGeneratingSummary by vm.isGeneratingSummary.collectAsStateWithLifecycle()
@@ -390,6 +391,7 @@ fun InterviewScreen(
                 asrState = asrState,
                 asrProgress = asrProgress,
                 asrStatus = asrStatus,
+                recognitionError = recognitionError,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 12.dp, vertical = 8.dp),
@@ -560,6 +562,7 @@ private fun StatusCard(
     asrState: AsrService.State,
     asrProgress: Float,
     asrStatus: String,
+    recognitionError: String?,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -596,7 +599,7 @@ private fun StatusCard(
         )
         InterviewViewModel.Phase.ERROR -> Triple(
             stringResource(R.string.phase_error_title),
-            stringResource(R.string.phase_error_subtitle),
+            recognitionError ?: stringResource(R.string.phase_error_subtitle),
             cs.error,
         )
     }
