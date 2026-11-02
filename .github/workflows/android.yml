@@ -15,6 +15,12 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: gradle/actions/setup-gradle@v4
+      - name: Download sherpa-onnx 1.13.1 (static ONNX Runtime)
+        shell: bash
+        run: |
+          curl --fail --location --retry 3 --output app/libs/sherpa-onnx.aar \
+            "https://huggingface.co/csukuangfj2/sherpa-onnx-libs/resolve/main/android/aar/1.13.1/sherpa-onnx-static-link-onnxruntime-1.13.1.aar"
+          echo "1cae99f3330e8da180cbf9d2e20c5257d4444d8713c4df4094a9471a2c11300b  app/libs/sherpa-onnx.aar" | sha256sum --check
       - run: bash ./gradlew --no-daemon assembleDebug testDebugUnitTest
       - name: Upload debug APK
         if: success()
