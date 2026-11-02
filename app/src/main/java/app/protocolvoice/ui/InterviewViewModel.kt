@@ -170,7 +170,32 @@ class InterviewViewModel(app: Application) : AndroidViewModel(app) {
         activateEmbedding(EmbeddingModel.CAMPlus, force = true)
     }
 
-    fun setEmbeddingModel(model: EmbeddingModel) = activateEmbedding(model)
+    private val _pendingEmbeddingDownload = MutableStateFlow<EmbeddingModel?>(null)
+    val pendingEmbeddingDownload: StateFlow<EmbeddingModel?> = _pendingEmbeddingDownload.asStateFlow()
+
+    fun embeddingDownloadSizeMb(model: EmbeddingModel): Int =
+        ((embeddingRegistryModel(model).sizeBytes + 999_999L) / 1_000_000L).toInt()
+
+    fun setEmbeddingModel(model: EmbeddingModel) {
+        if (_embeddingModel.value == model || _isReloadingEmbedding.value) return
+        viewModelScope.launch {
+            val available = withContext(Dispatchers.IO) {
+                ModelStorage(getApplication()).isValid(embeddingRegistryModel(model))
+            }
+            if (available) activateEmbedding(model)
+            else _pendingEmbeddingDownload.value = model
+        }
+    }
+
+    fun confirmEmbeddingDownload() {
+        val pending = _pendingEmbeddingDownload.value ?: return
+        _pendingEmbeddingDownload.value = null
+        activateEmbedding(pending)
+    }
+
+    fun cancelEmbeddingDownload() {
+        _pendingEmbeddingDownload.value = null
+    }
 
     private fun activateEmbedding(model: EmbeddingModel, force: Boolean = false) {
         if ((!force && _embeddingModel.value == model) || _isReloadingEmbedding.value) return
