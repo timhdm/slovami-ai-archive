@@ -435,6 +435,7 @@ fun InterviewScreen(
                 val speakerMode by vm.speakerCountMode.collectAsStateWithLifecycle()
                 val embeddingModel by vm.embeddingModel.collectAsStateWithLifecycle()
                 val isReloading by vm.isReloadingEmbedding.collectAsStateWithLifecycle()
+                val downloadProgress by vm.embeddingDownloadProgress.collectAsStateWithLifecycle()
                 SpeakerCountSelector(
                     selected = speakerMode,
                     onSelect = { vm.setSpeakerCountMode(it) },
@@ -445,6 +446,7 @@ fun InterviewScreen(
                 EmbeddingModelSelector(
                     selected = embeddingModel,
                     isReloading = isReloading,
+                    downloadProgress = downloadProgress,
                     onSelect = { vm.setEmbeddingModel(it) },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1201,6 +1203,7 @@ private fun speakerModeLabel(mode: SpeakerCountMode): String = when (mode) {
 private fun EmbeddingModelSelector(
     selected: EmbeddingModel,
     isReloading: Boolean,
+    downloadProgress: Float,
     onSelect: (EmbeddingModel) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1236,6 +1239,13 @@ private fun EmbeddingModelSelector(
                     color = cs.onSurfaceVariant,
                 )
             }
+            if (isReloading) {
+                Text("Загрузка модели: ${(downloadProgress * 100).toInt()}%")
+                LinearProgressIndicator(
+                    progress = { downloadProgress.coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
             Spacer(Modifier.height(8.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1245,7 +1255,7 @@ private fun EmbeddingModelSelector(
                     SpeakerChip(
                         label = stringResource(model.displayNameRes),
                         active = model == selected,
-                        onClick = { onSelect(model) },
+                        onClick = { if (!isReloading) onSelect(model) },
                         modifier = Modifier.weight(1f),
                     )
                 }
