@@ -397,6 +397,15 @@ fun InterviewScreen(
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             )
 
+            if (phase == InterviewViewModel.Phase.ERROR) {
+                Button(
+                    onClick = { vm.retryRecognitionWithExistingAudio() },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                ) {
+                    Text("Вернуться к записи и повторить распознавание")
+                }
+            }
+
             // ---- Сообщение об импорте аудио ----
             if (isImportingAudio) {
                 Card(
