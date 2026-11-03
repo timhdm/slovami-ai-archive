@@ -1,4 +1,4 @@
-# ProtocolVoice
+# Slovami AI
 
 > **Professional offline voice transcription for Android.**
 > Audit-grade quality, multi-speaker, fully on-device, with interview summarization.
@@ -7,17 +7,17 @@
 [![Platform: Android](https://img.shields.io/badge/Platform-Android_8.0%2B-green.svg)](https://www.android.com)
 [![Privacy: 100%25 offline](https://img.shields.io/badge/Privacy-100%25%20offline-brightgreen.svg)](#privacy)
 
-ProtocolVoice transcribes interviews, meetings, and conversations **directly on your phone** — without sending audio to any cloud service. Generates court-ready DOCX protocols with speaker identification, timestamps, and confidence indicators. Includes built-in interview summarization that extracts names, organizations, key quotes, risks, and numerical data — all on-device.
+Slovami AI transcribes interviews, meetings, and conversations **directly on your phone** — without sending audio to any cloud service. Generates court-ready DOCX protocols with speaker identification, timestamps, and confidence indicators. Includes built-in interview summarization that extracts names, organizations, key quotes, risks, and numerical data — all on-device.
 
 Designed for auditors, journalists, researchers, and other professionals who need transcription quality with privacy guarantees.
 
 ---
 
-## Why ProtocolVoice
+## Why Slovami AI
 
 Most voice transcription apps send your audio to remote servers for processing. For confidential interviews — audits, internal investigations, sensitive research — this is a non-starter.
 
-ProtocolVoice runs **everything on your device**:
+Slovami AI runs **everything on your device**:
 - Recording → on device
 - ASR (speech-to-text) → on device, using GigaAM-v3 (Russian) or Whisper base (English)
 - Speaker diarization → on device, using ERes2Net / CAM++ embeddings
@@ -67,7 +67,7 @@ ProtocolVoice runs **everything on your device**:
 
 ## Summarization architecture
 
-ProtocolVoice has a **two-tier summarization system**, designed so users always get a useful summary without an LLM, but can opt in to a narrative summary if they want one.
+Slovami AI has a **two-tier summarization system**, designed so users always get a useful summary without an LLM, but can opt in to a narrative summary if they want one.
 
 ### Default tier (always available)
 
@@ -126,8 +126,8 @@ Download the latest APK from [Releases](../../releases/latest) and install. Allo
 ### Option 2: Build from source
 
 ```bash
-git clone https://github.com/conwerter1/protocolvoice.git
-cd protocolvoice
+git clone https://github.com/timhdm/slovami-ai.git
+cd slovami-ai
 
 # Install Android SDK 34, JDK 17 if not already
 ./gradlew assembleDebug
