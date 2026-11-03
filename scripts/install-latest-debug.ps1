@@ -1,7 +1,7 @@
 # Downloads the latest workflow run for this branch and installs its signed debug APK.
 # Requirements: GitHub CLI (gh), Android platform-tools (adb), connected Android device.
 param(
-    [string]$Repository = 'timhdm/protocolvoice',
+    [string]$Repository = 'timhdm/slovami-ai',
     [string]$Branch = 'fix/eres2net-diarization-crash'
 )
 
@@ -42,7 +42,7 @@ if ($LASTEXITCODE -ne 0 -or $devices.Count -ne 1) {
     throw "Expected exactly one authorized ADB device, found $($devices.Count). Check: adb devices"
 }
 
-$dir = Join-Path ([System.IO.Path]::GetTempPath()) ("protocolvoice-" + $run.databaseId + "-" + [guid]::NewGuid().ToString("N"))
+$dir = Join-Path ([System.IO.Path]::GetTempPath()) ("slovami-ai-" + $run.databaseId + "-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 Write-Host 'Downloading debug APK...'
 & gh run download $run.databaseId --repo $Repository --name protocolvoice-debug-apk --dir $dir
