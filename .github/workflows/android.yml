@@ -78,7 +78,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: protocolvoice-debug-apk
+          name: slovami-ai-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
