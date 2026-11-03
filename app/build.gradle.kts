@@ -9,7 +9,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "app.protocolvoice"
+        applicationId = "app.slovami.ai"
         minSdk = 26
         targetSdk = 34
         versionCode = 2
