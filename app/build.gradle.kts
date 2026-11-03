@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "app.protocolvoice"
+    namespace = "app.slovami.ai"
     compileSdk = 34
 
     defaultConfig {
