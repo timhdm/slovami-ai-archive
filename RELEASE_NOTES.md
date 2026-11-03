@@ -1,4 +1,4 @@
-# ProtocolVoice v1.0.0 — Initial release
+# Slovami AI v1.0.0 — Initial release
 
 First public release of ProtocolVoice, an Android app for offline interview transcription.
 

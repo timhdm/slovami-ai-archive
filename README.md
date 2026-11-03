@@ -152,7 +152,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 4. **Tap "Распознать"** (Transcribe) — ASR + diarization runs (typically 1-3 min for 30-min recording on modern hardware). Long files are automatically chunked to handle GigaAM-v3's ~50 sec encoder limit.
 5. **Edit speaker names** in the result list if needed.
 6. **Tap "Резюме"** (Summary) — extracts facts, key quotes, risks, and numbers (~6 seconds). Copy, share, or save as .txt.
-7. **Tap "Сохранить DOCX"** (Save DOCX) — protocol is written to `Downloads/ProtocolVoice/`.
+7. **Tap "Сохранить DOCX"** (Save DOCX) — protocol is written to `Downloads/SlovamiAI/`.
 
 ---
 

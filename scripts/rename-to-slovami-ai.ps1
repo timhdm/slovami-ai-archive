@@ -18,8 +18,8 @@ foreach ($relative in $tracked) {
     $full = Join-Path $repoRoot ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
     $text = [IO.File]::ReadAllText($full)
-    $updated = $text.Replace('app.protocolvoice', 'app.slovami.ai')
-    $updated = $updated.Replace('ProtocolVoiceApp', 'SlovamiAiApp')
+    $updated = $text.Replace('app.slovami.ai', 'app.slovami.ai')
+    $updated = $updated.Replace('SlovamiAiApp', 'SlovamiAiApp')
     if ($ext -in @('.kt', '.kts')) {
         $updated = $updated.Replace('ProtocolVoice', 'SlovamiAI')
     } elseif ($ext -eq '.xml') {
@@ -34,8 +34,8 @@ foreach ($relative in $tracked) {
         $updated = $updated.Replace('## Why ProtocolVoice', '## Why Slovami AI')
         $updated = $updated.Replace('Downloads/ProtocolVoice', 'Downloads/SlovamiAI')
     } elseif ($ext -eq '.ps1') {
-        $updated = $updated.Replace("'timhdm/protocolvoice'", "'timhdm/slovami-ai'")
-        $updated = $updated.Replace('protocolvoice-debug-apk', 'slovami-ai-debug-apk')
+        $updated = $updated.Replace("'timhdm/slovami-ai'", "'timhdm/slovami-ai'")
+        $updated = $updated.Replace('slovami-ai-debug-apk', 'slovami-ai-debug-apk')
     }
     if ($updated -cne $text) {
         [IO.File]::WriteAllText($full, $updated, [Text.UTF8Encoding]::new($false))
@@ -54,7 +54,7 @@ foreach ($source in $roots) {
 }
 
 # Rename the Application class file, if present.
-$appFile = 'app/src/main/java/app/slovami/ai/ProtocolVoiceApp.kt'
+$appFile = 'app/src/main/java/app/slovami/ai/SlovamiAiApp.kt'
 if (Test-Path $appFile) {
     git mv $appFile 'app/src/main/java/app/slovami/ai/SlovamiAiApp.kt'
     if ($LASTEXITCODE -ne 0) { throw 'Could not rename Application source file.' }

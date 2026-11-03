@@ -45,7 +45,7 @@ if ($LASTEXITCODE -ne 0 -or $devices.Count -ne 1) {
 $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("slovami-ai-" + $run.databaseId + "-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 Write-Host 'Downloading debug APK...'
-& gh run download $run.databaseId --repo $Repository --name protocolvoice-debug-apk --dir $dir
+& gh run download $run.databaseId --repo $Repository --name slovami-ai-debug-apk --dir $dir
 if ($LASTEXITCODE -ne 0) { throw 'Could not download APK artifact.' }
 
 $apks = @(Get-ChildItem -Path $dir -Filter '*.apk' -File -Recurse)

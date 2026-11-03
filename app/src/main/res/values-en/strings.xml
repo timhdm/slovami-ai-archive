@@ -160,9 +160,9 @@
     <string name="toast_session_delete_failed">Could not delete</string>
     <string name="toast_docx_save_failed">Could not save DOCX</string>
     <string name="toast_docx_save_error">Save error: %1$s</string>
-    <string name="toast_export_done_with_audio">DOCX and audio saved to Downloads/ProtocolVoice</string>
+    <string name="toast_export_done_with_audio">DOCX and audio saved to Downloads/SlovamiAI</string>
     <string name="toast_export_done_compressing">DOCX saved. Audio is compressing, retry in a minute</string>
-    <string name="toast_export_done">DOCX saved to Downloads/ProtocolVoice</string>
+    <string name="toast_export_done">DOCX saved to Downloads/SlovamiAI</string>
 
     <!-- =================================================== -->
     <!-- Foreground notification (RecordingService) -->
