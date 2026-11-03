@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ProtocolVoice</string>
+    <string name="app_name">Slovami AI</string>
 
     <!-- =================================================== -->
     <!-- Основной экран: TopBar, статусы, кнопки записи -->
@@ -245,7 +245,7 @@
 
     <!-- About / Acknowledgments screen -->
     <string name="about_title">О программе</string>
-    <string name="about_app_name">ProtocolVoice</string>
+    <string name="about_app_name">Slovami AI</string>
     <string name="about_tagline">Автономная расшифровка интервью</string>
     <string name="about_version_label">Версия</string>
     <string name="about_description">Оффлайновый диктофон с распознаванием речи и разделением говорящих для аудиторских интервью. Вся обработка происходит на устройстве — данные никуда не отправляются.</string>
