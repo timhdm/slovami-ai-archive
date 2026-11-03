@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "app.protocolvoice"
+    namespace = "app.slovami.ai"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "app.protocolvoice"
+        applicationId = "app.slovami.ai"
         minSdk = 26
         targetSdk = 34
         versionCode = 2
@@ -23,12 +23,26 @@ android {
         }
     }
 
+    signingConfigs {
+        create("ciDebug") {
+            storeFile = file(System.getenv("DEBUG_KEYSTORE_PATH") ?: "missing-debug-keystore.jks")
+            storePassword = System.getenv("DEBUG_KEYSTORE_PASSWORD")
+            keyAlias = "protocolvoice-debug"
+            keyPassword = System.getenv("DEBUG_KEY_PASSWORD")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
         }
         debug {
             isDebuggable = true
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+            if (System.getenv("DEBUG_KEYSTORE_PATH") != null) {
+                signingConfig = signingConfigs.getByName("ciDebug")
+            }
         }
     }
 

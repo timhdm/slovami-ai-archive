@@ -20,5 +20,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ProtocolVoice"
+rootProject.name = "Slovami AI"
 include(":app")

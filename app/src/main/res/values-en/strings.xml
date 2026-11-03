@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">ProtocolVoice</string>
+    <string name="app_name">Slovami AI</string>
 
     <!-- =================================================== -->
     <!-- Main screen: TopBar, status, recording controls -->
@@ -160,9 +160,9 @@
     <string name="toast_session_delete_failed">Could not delete</string>
     <string name="toast_docx_save_failed">Could not save DOCX</string>
     <string name="toast_docx_save_error">Save error: %1$s</string>
-    <string name="toast_export_done_with_audio">DOCX and audio saved to Downloads/ProtocolVoice</string>
+    <string name="toast_export_done_with_audio">DOCX and audio saved to Downloads/SlovamiAI</string>
     <string name="toast_export_done_compressing">DOCX saved. Audio is compressing, retry in a minute</string>
-    <string name="toast_export_done">DOCX saved to Downloads/ProtocolVoice</string>
+    <string name="toast_export_done">DOCX saved to Downloads/SlovamiAI</string>
 
     <!-- =================================================== -->
     <!-- Foreground notification (RecordingService) -->
@@ -239,7 +239,7 @@
 
     <!-- About / Acknowledgments screen -->
     <string name="about_title">About</string>
-    <string name="about_app_name">ProtocolVoice</string>
+    <string name="about_app_name">Slovami AI</string>
     <string name="about_tagline">Offline interview transcription</string>
     <string name="about_version_label">Version</string>
     <string name="about_description">Offline voice recorder with on-device speech recognition and speaker diarization for audit interviews. All processing happens on the device — data never leaves your phone.</string>

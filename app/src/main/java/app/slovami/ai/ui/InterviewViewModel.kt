@@ -1,0 +1,1521 @@
+package app.slovami.ai.ui
+
+import android.util.Log
+import android.app.Application
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import androidx.core.content.FileProvider
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import app.slovami.ai.R
+import app.slovami.ai.asr.AsrLanguage
+import app.slovami.ai.asr.AsrService
+import app.slovami.ai.asr.EmbeddingModel
+import app.slovami.ai.asr.EnglishAsrService
+import app.slovami.ai.asr.InterviewMetadata
+import app.slovami.ai.asr.InterviewTranscript
+import app.slovami.ai.asr.Participants
+import app.slovami.ai.asr.SpeakerCountMode
+import app.slovami.ai.asr.TranscriptSegment
+import app.slovami.ai.audio.AudioPlayer
+import app.slovami.ai.audio.AudioRecorder
+import app.slovami.ai.audio.AudioImporter
+import app.slovami.ai.audio.LongAudioProcessor
+import app.slovami.ai.audio.LongTaskRunner
+import app.slovami.ai.audio.Mp4Encoder
+import app.slovami.ai.audio.ProcessingService
+import app.slovami.ai.data.SessionStore
+import app.slovami.ai.docx.DocxBuilder
+import app.slovami.ai.downloader.ModelDownloader
+import app.slovami.ai.downloader.ModelRegistry
+import app.slovami.ai.downloader.ModelStorage
+import app.slovami.ai.summary.SummaryFacade
+import app.slovami.ai.summary.SummaryFormatter
+import app.slovami.ai.summary.default_tier.SummaryResult
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * Единый ViewModel для экрана интервью. Управляет жизненным циклом записи,
+ * запуска ASR и экспортом DOCX. Composable-экран только наблюдает StateFlow'ы.
+ *
+ * Workflow:
+ *   IDLE → RECORDING ↔ PAUSED → STOPPED → PROCESSING → READY → (ExportDocx)
+ *
+ * Воспроизведения аудио и редактирования сегментов в этой версии нет —
+ * только фиксация распознанного и выгрузка протокола.
+ */
+class InterviewViewModel(app: Application) : AndroidViewModel(app) {
+
+    enum class Phase {
+        /** Стартовое состояние, можно настраивать метаданные/участников и записывать. */
+        IDLE,
+        /** Идёт запись. */
+        RECORDING,
+        /** Пауза в записи. */
+        PAUSED,
+        /** Запись остановлена, файл готов, ASR ещё не запущен. */
+        RECORDED,
+        /** ASR работает. */
+        PROCESSING,
+        /** Распознавание завершилось, можно править и экспортировать. */
+        READY,
+        /** Ошибка. */
+        ERROR,
+    }
+
+
+    val recorder: AudioRecorder = AudioRecorder(app)
+    val asr: AsrService = AsrService(app)
+    val player: AudioPlayer = AudioPlayer(app)
+
+    private val _phase = MutableStateFlow(Phase.IDLE)
+    val phase: StateFlow<Phase> = _phase.asStateFlow()
+
+    private val _recognitionError = MutableStateFlow<String?>(null)
+    val recognitionError: StateFlow<String?> = _recognitionError.asStateFlow()
+
+    private val _metadata = MutableStateFlow(InterviewMetadata())
+    val metadata: StateFlow<InterviewMetadata> = _metadata.asStateFlow()
+
+    private val _participants = MutableStateFlow(Participants())
+    val participants: StateFlow<Participants> = _participants.asStateFlow()
+
+    private val _transcript = MutableStateFlow<InterviewTranscript?>(null)
+    val transcript: StateFlow<InterviewTranscript?> = _transcript.asStateFlow()
+
+    private val _wavFile = MutableStateFlow<File?>(null)
+    val wavFile: StateFlow<File?> = _wavFile.asStateFlow()
+
+    /** Путь к M4A-файлу записи. Заполняется после фоновой конвертации WAV → AAC.
+     *  Пока null — исходный WAV в _wavFile ещё живёт и используется как fallback. */
+    private val _m4aFile = MutableStateFlow<File?>(null)
+    val m4aFile: StateFlow<File?> = _m4aFile.asStateFlow()
+
+    /** true пока WAV→M4A конвертируется в фоне (для UI-индикатора). */
+    private val _isCompressing = MutableStateFlow(false)
+    val isCompressing: StateFlow<Boolean> = _isCompressing.asStateFlow()
+
+    private val _exportedDocx = MutableStateFlow<Uri?>(null)
+    val exportedDocx: StateFlow<Uri?> = _exportedDocx.asStateFlow()
+
+    private val _toast = MutableStateFlow<String?>(null)
+    val toast: StateFlow<String?> = _toast.asStateFlow()
+
+    /** ID текущей сохранённой сессии. null = ещё не сохраняли. */
+    private val _currentSessionId = MutableStateFlow<String?>(null)
+    val currentSessionId: StateFlow<String?> = _currentSessionId.asStateFlow()
+
+    /**
+     * Режим выбора количества спикеров: 1 / 2 / 3 / 4 / Авто.
+     * Выставляется в UI до нажатия «Распознать». Single пропускает диаризацию
+     * целиком (RTF ≈0.07). Fixed(N) даёт стабильное количество спикеров
+     * и небольшое ускорение кластеризации. Auto — прежнее поведение.
+     */
+    private val _speakerCountMode = MutableStateFlow<SpeakerCountMode>(SpeakerCountMode.Auto)
+    val speakerCountMode: StateFlow<SpeakerCountMode> = _speakerCountMode.asStateFlow()
+
+    fun setSpeakerCountMode(mode: SpeakerCountMode) {
+        _speakerCountMode.value = mode
+    }
+
+    /**
+     * Выбранная embedding-модель для диаризации. Сохраняется в SharedPreferences —
+     * переживает рестарт приложения. При изменении триггерит перезагрузку
+     * диаризации в фоне (~1-2 сек, не блокирует UI).
+     */
+    private val _embeddingModel = MutableStateFlow(loadEmbeddingPref())
+    val embeddingModel: StateFlow<EmbeddingModel> = _embeddingModel.asStateFlow()
+
+    /** true пока идёт перезагрузка embedding-модели. UI показывает индикатор. */
+    private val _isReloadingEmbedding = MutableStateFlow(false)
+    val isReloadingEmbedding: StateFlow<Boolean> = _isReloadingEmbedding.asStateFlow()
+
+
+    private val _embeddingDownloadProgress = MutableStateFlow(0f)
+    val embeddingDownloadProgress: StateFlow<Float> = _embeddingDownloadProgress.asStateFlow()
+
+    private val _missingSavedEmbedding = MutableStateFlow<EmbeddingModel?>(null)
+    val missingSavedEmbedding: StateFlow<EmbeddingModel?> = _missingSavedEmbedding.asStateFlow()
+
+    private fun embeddingRegistryModel(model: EmbeddingModel) = when (model) {
+        EmbeddingModel.CAMPlus -> ModelRegistry.EMBEDDING_CAMPLUS
+        EmbeddingModel.ERes2Net -> ModelRegistry.EMBEDDING_V1
+        EmbeddingModel.ERes2NetV2 -> ModelRegistry.EMBEDDING_V2
+    }
+
+    fun downloadSavedEmbedding() {
+        val missing = _missingSavedEmbedding.value ?: return
+        activateEmbedding(missing, force = true)
+    }
+
+    fun useCamPlusInstead() {
+        if (_isReloadingEmbedding.value) return
+        _missingSavedEmbedding.value = null
+        _embeddingModel.value = EmbeddingModel.CAMPlus
+        saveEmbeddingPref(EmbeddingModel.CAMPlus)
+        activateEmbedding(EmbeddingModel.CAMPlus, force = true)
+    }
+
+    private val _pendingEmbeddingDownload = MutableStateFlow<EmbeddingModel?>(null)
+    val pendingEmbeddingDownload: StateFlow<EmbeddingModel?> = _pendingEmbeddingDownload.asStateFlow()
+
+    fun embeddingDownloadSizeMb(model: EmbeddingModel): Int =
+        ((embeddingRegistryModel(model).sizeBytes + 999_999L) / 1_000_000L).toInt()
+
+    fun setEmbeddingModel(model: EmbeddingModel) {
+        if (_embeddingModel.value == model || _isReloadingEmbedding.value) return
+        viewModelScope.launch {
+            val available = withContext(Dispatchers.IO) {
+                ModelStorage(getApplication()).isValid(embeddingRegistryModel(model))
+            }
+            if (available) activateEmbedding(model)
+            else _pendingEmbeddingDownload.value = model
+        }
+    }
+
+    fun confirmEmbeddingDownload() {
+        val pending = _pendingEmbeddingDownload.value ?: return
+        _pendingEmbeddingDownload.value = null
+        activateEmbedding(pending)
+    }
+
+    fun cancelEmbeddingDownload() {
+        _pendingEmbeddingDownload.value = null
+    }
+
+    private fun activateEmbedding(model: EmbeddingModel, force: Boolean = false) {
+        if ((!force && _embeddingModel.value == model) || _isReloadingEmbedding.value) return
+        viewModelScope.launch {
+            _isReloadingEmbedding.value = true
+            _embeddingDownloadProgress.value = 0f
+            try {
+                val storage = ModelStorage(getApplication())
+                val registryModel = embeddingRegistryModel(model)
+                if (!withContext(Dispatchers.IO) { storage.isValid(registryModel) }) {
+                    val downloader = ModelDownloader(storage)
+                    val progressJob = launch {
+                        downloader.bytesDownloaded.collect { bytes ->
+                            _embeddingDownloadProgress.value =
+                                (bytes.toFloat() / registryModel.sizeBytes).coerceIn(0f, 1f)
+                        }
+                    }
+                    val downloaded = try {
+                        downloader.downloadAll(listOf(registryModel))
+                    } finally {
+                        progressJob.cancel()
+                    }
+                    if (!downloaded) {
+                        _toast.value = "Не удалось скачать ${registryModel.filename}: " +
+                            (downloader.errorMessage.value ?: "проверьте подключение")
+                        return@launch
+                    }
+                }
+                val ready = asr.initialize(model)
+                if (ready) {
+                    _embeddingModel.value = model
+                    saveEmbeddingPref(model)
+                    _missingSavedEmbedding.value = null
+                    _embeddingDownloadProgress.value = 1f
+                } else {
+                    _toast.value = asr.errorMessage.value ?: "Не удалось загрузить модель"
+                }
+            } catch (e: Exception) {
+                Log.e("InterviewVM", "Embedding model setup failed", e)
+                _toast.value = "Ошибка загрузки модели: ${e.message}"
+            } finally {
+                _isReloadingEmbedding.value = false
+            }
+        }
+    }
+
+    fun retryRecognitionWithExistingAudio() {
+        if (_wavFile.value?.isFile != true || LongTaskRunner.recognitionInProgress.value) return
+        _recognitionError.value = null
+        _phase.value = Phase.RECORDED
+    }
+
+    private fun prefs() = getApplication<Application>()
+        .getSharedPreferences("interview_prefs", Context.MODE_PRIVATE)
+
+    private fun loadEmbeddingPref(): EmbeddingModel {
+        val name = prefs().getString("embedding_model", null) ?: return EmbeddingModel.DEFAULT
+        return runCatching { EmbeddingModel.valueOf(name) }.getOrDefault(EmbeddingModel.DEFAULT)
+    }
+
+    private fun saveEmbeddingPref(model: EmbeddingModel) {
+        prefs().edit().putString("embedding_model", model.name).apply()
+    }
+
+    /** Подгрузить ASR-модели в фоне, если ещё не загружены. */
+    /**
+     * Язык распознавания речи. RU — GigaAM-v3 (русский, по умолчанию),
+     * EN — Whisper base.en (английский, скачивается опционально).
+     * Сохраняется в SharedPreferences — выбор переживает рестарт приложения.
+     */
+    private val _asrLanguage = MutableStateFlow(loadAsrLanguagePref())
+    val asrLanguage: StateFlow<AsrLanguage> = _asrLanguage.asStateFlow()
+
+    fun setAsrLanguage(lang: AsrLanguage) {
+        if (_asrLanguage.value == lang) return
+        _asrLanguage.value = lang
+        prefs().edit().putString("asr_language", lang.name).apply()
+
+        // Одновременно меняем язык интерфейса. Архитектурное решение:
+        // RU/EN язык распознавания = RU/EN язык UI. Проще и логичнее для пользователя.
+        // Используем AppCompatDelegate.setApplicationLocales() — работает в runtime без перезапуска
+        // или с автоматическим рестартом Activity (в зависимости от configChanges).
+        val localeTag = when (lang) {
+            AsrLanguage.RU -> "ru"
+            AsrLanguage.EN -> "en"
+        }
+        val locales = androidx.core.os.LocaleListCompat.forLanguageTags(localeTag)
+        androidx.appcompat.app.AppCompatDelegate.setApplicationLocales(locales)
+    }
+
+    private fun loadAsrLanguagePref(): AsrLanguage {
+        val name = prefs().getString("asr_language", null) ?: return AsrLanguage.RU
+        return runCatching { AsrLanguage.valueOf(name) }.getOrDefault(AsrLanguage.RU)
+    }
+
+    /**
+     * Скачаны ли все модели для выбранного языка. UI использует чтобы
+     * показать diaog "скачать" или бадж "нужны модели".
+     */
+    fun isAsrLanguageReady(ctx: Context, lang: AsrLanguage): Boolean {
+        val storage = ModelStorage(ctx)
+        return when (lang) {
+            AsrLanguage.RU -> ModelRegistry.FIRST_RUN_REQUIRED.all { storage.isValid(it, checkHash = false) }
+            AsrLanguage.EN -> ModelRegistry.EN_ASR_BUNDLE.all { storage.isValid(it, checkHash = false) }
+        }
+    }
+
+    /** Скачать EN модели. Вызывается из UI диалога "Скачать?". */
+    private val _isDownloadingEn = MutableStateFlow(false)
+    val isDownloadingEn: StateFlow<Boolean> = _isDownloadingEn.asStateFlow()
+
+    private val _enDownloadProgress = MutableStateFlow(0f)
+    val enDownloadProgress: StateFlow<Float> = _enDownloadProgress.asStateFlow()
+
+    fun downloadEnglishModels(ctx: Context, onComplete: (Boolean) -> Unit = {}) {
+        if (_isDownloadingEn.value) return  // уже качается
+        viewModelScope.launch(Dispatchers.IO) {
+            _isDownloadingEn.value = true
+            _enDownloadProgress.value = 0f
+            try {
+                val storage = ModelStorage(ctx)
+                val missing = ModelRegistry.EN_ASR_BUNDLE.filter { !storage.isValid(it, checkHash = false) }
+                if (missing.isEmpty()) {
+                    _enDownloadProgress.value = 1f
+                    withContext(Dispatchers.Main) { onComplete(true) }
+                    return@launch
+                }
+                val downloader = ModelDownloader(storage)
+                // Подписываемся на прогресс
+                val totalBytes = missing.sumOf { it.sizeBytes }
+                val progressJob = launch {
+                    downloader.bytesDownloaded.collect { bytes ->
+                        if (totalBytes > 0) _enDownloadProgress.value = bytes.toFloat() / totalBytes
+                    }
+                }
+                val ok = downloader.downloadAll(missing)
+                progressJob.cancel()
+                _enDownloadProgress.value = if (ok) 1f else 0f
+                withContext(Dispatchers.Main) {
+                    _toast.value = if (ok) "Английские модели скачаны" else "Не удалось скачать английские модели"
+                    onComplete(ok)
+                }
+            } catch (e: Throwable) {
+                android.util.Log.e("InterviewViewModel", "downloadEnglishModels failed", e)
+                withContext(Dispatchers.Main) {
+                    _toast.value = "Ошибка скачивания: ${e.message?.take(80)}"
+                    onComplete(false)
+                }
+            } finally {
+                _isDownloadingEn.value = false
+            }
+        }
+    }
+
+    /**
+     * EnglishAsrService — singleton lazy. Создаётся только когда нужен.
+     * Переиспользуется между вызовами transcribe() чтобы не перезагружать Whisper.
+     */
+    private var enAsr: EnglishAsrService? = null
+
+    /** Получить (или создать) EN ASR-сервис и инициализировать его. */
+    private suspend fun ensureEnAsr(ctx: Context): EnglishAsrService? {
+        var svc = enAsr
+        if (svc == null) {
+            svc = EnglishAsrService(ctx)
+            if (!svc.initialize()) {
+                svc.release()
+                return null
+            }
+            enAsr = svc
+        }
+        return svc
+    }
+
+    fun preloadAsrModels() {
+        viewModelScope.launch {
+            val selected = _embeddingModel.value
+            val storage = ModelStorage(getApplication())
+            val available = withContext(Dispatchers.IO) {
+                storage.isValid(embeddingRegistryModel(selected))
+            }
+            if (!available) {
+                _missingSavedEmbedding.value = selected
+                return@launch
+            }
+            if (!_isReloadingEmbedding.value) asr.initialize(selected)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Импорт аудиофайла из внешнего источника (SAF / file picker)
+    // -----------------------------------------------------------------
+
+    /** Идёт импорт аудио (mp3/m4a/wav/...) → WAV 16kHz mono. */
+    private val _isImportingAudio = MutableStateFlow(false)
+    val isImportingAudio: StateFlow<Boolean> = _isImportingAudio.asStateFlow()
+
+    /** Прогресс импорта [0..1]. */
+    private val _importProgress = MutableStateFlow(0f)
+    val importProgress: StateFlow<Float> = _importProgress.asStateFlow()
+
+    // ВАЖНО: эти поля должны быть объявлены ДО init {} блока — иначе подписки
+    // в init обращаются к ним когда они ещё null, и приложение крашится при старте.
+
+    /** Результат саммаризации. null пока не сгенерировано. */
+    private val _summaryResult = MutableStateFlow<SummaryResult?>(null)
+    val summaryResult: StateFlow<SummaryResult?> = _summaryResult.asStateFlow()
+
+    /** Идёт генерация резюме (UI показывает spinner). */
+    private val _isGeneratingSummary = MutableStateFlow(false)
+    val isGeneratingSummary: StateFlow<Boolean> = _isGeneratingSummary.asStateFlow()
+
+    /** Ошибка генерации (null если ок). */
+    private val _summaryError = MutableStateFlow<String?>(null)
+    val summaryError: StateFlow<String?> = _summaryError.asStateFlow()
+
+    /** URI последнего сохранённого .txt файла резюме (для повторного шаринга). */
+    private val _exportedSummaryUri = MutableStateFlow<Uri?>(null)
+    val exportedSummaryUri: StateFlow<Uri?> = _exportedSummaryUri.asStateFlow()
+
+    init {
+        // При создании ViewModel подписываемся на LongTaskRunner — на случай
+        // если импорт уже идёт (был звонок, Activity пересоздалась).
+        viewModelScope.launch {
+            LongTaskRunner.importInProgress.collect { running ->
+                _isImportingAudio.value = running
+            }
+        }
+        viewModelScope.launch {
+            LongTaskRunner.importProgress.collect { p ->
+                _importProgress.value = p
+            }
+        }
+        viewModelScope.launch {
+            LongTaskRunner.importResult.collect { result ->
+                if (result == null) return@collect
+                if (result.error != null) {
+                    Log.e("InterviewVM", "Audio import failed: ${result.error}")
+                    _toast.value = "Не удалось импортировать аудио: ${result.error}"
+                    _phase.value = Phase.IDLE
+                } else {
+                    _wavFile.value = result.wavFile
+                    _phase.value = Phase.RECORDED
+                    _toast.value = "Аудио импортировано (${result.durationMs / 1000}с). Нажмите «Распознать»."
+                    Log.i(
+                        "InterviewVM",
+                        "Audio imported (via LongTaskRunner): ${result.wavFile.absolutePath} " +
+                            "(${result.durationMs}ms, src=${result.sourceSampleRate}Hz/${result.sourceChannels}ch)",
+                    )
+                }
+                LongTaskRunner.clearImportResult()
+            }
+        }
+
+        // Подписка на результат распознавания — живёт в LongTaskRunner, переживает звонок.
+        viewModelScope.launch {
+            LongTaskRunner.recognitionResult.collect { r ->
+                if (r == null) return@collect
+                if (r.error != null) {
+                    Log.e("InterviewVM", "Recognition failed: ${r.error}")
+                    _toast.value = r.error
+                    _recognitionError.value = if (r.error.contains("Speaker embedding model is missing or empty")) {
+                        "Выбранная модель разделения говорящих не загружена. Выберите CAM++ или загрузите нужную модель перед распознаванием."
+                    } else {
+                        r.error
+                    }
+                    _phase.value = Phase.ERROR
+                } else {
+                    _recognitionError.value = null
+                    val t = r.transcript as? app.slovami.ai.asr.InterviewTranscript
+                    if (t == null) {
+                        _phase.value = Phase.ERROR
+                    } else {
+                        _transcript.value = t
+                        // Сохраняем ранее введённые имена участников, остальные «Спикер N»
+                        val current = _participants.value.names.toMutableMap()
+                        _participants.value = Participants(current)
+                        _phase.value = Phase.READY
+                        _currentSessionId.value = SessionStore.newId()
+                        saveCurrentSession()
+                        compressWavToM4aInBackground(r.wavFile)
+                    }
+                }
+                LongTaskRunner.clearRecognitionResult()
+            }
+        }
+
+        // Подписка на результат резюме — живёт в LongTaskRunner, переживает звонок.
+        viewModelScope.launch {
+            LongTaskRunner.summaryInProgress.collect { running ->
+                _isGeneratingSummary.value = running
+            }
+        }
+        viewModelScope.launch {
+            LongTaskRunner.summaryOutcome.collect { o ->
+                if (o == null) return@collect
+                if (o.error != null) {
+                    Log.e("InterviewVM", "Summary failed: ${o.error}")
+                    _summaryError.value = o.error
+                    _toast.value = "Ошибка генерации резюме: ${o.error}"
+                } else {
+                    val r = o.result as? SummaryResult
+                    if (r == null) {
+                        _summaryError.value = "Неверный тип результата"
+                    } else {
+                        _summaryResult.value = r
+                        Log.i(
+                            "InterviewVM",
+                            "Summary done in ${r.processingTimeMs}ms: " +
+                                "${r.persons.size} PER, ${r.organizations.size} ORG, " +
+                                "${r.locations.size} LOC, ${r.topQuotes.size} quotes",
+                        )
+                    }
+                }
+                LongTaskRunner.clearSummaryOutcome()
+            }
+        }
+    }
+
+    /**
+     * Импортировать аудиофайл из внешнего URI (из файл-пикера SAF).
+     *
+     * Источник может быть любым (mp3/m4a/wav/ogg/aac/flac/3gp/amr) — всё что андроид
+     * MediaCodec умеет распаковать. На выходе — 16kHz mono PCM16 WAV в filesDir/recordings/.
+     *
+     * После успеха приложение переходит в фазу RECORDED — пользователь может выбрать
+     * режим спикеров и нажать «Распознать» как обычно.
+     */
+    fun importAudioFromUri(uri: Uri) {
+        if (_isImportingAudio.value) return
+        // Сбрасываем предыдущую сессию прежде чем стартовать импорт
+        player.stop()
+        player.release()
+        _transcript.value = null
+        _m4aFile.value = null
+        _exportedDocx.value = null
+        _summaryResult.value = null
+        _summaryError.value = null
+        _exportedSummaryUri.value = null
+        _currentSessionId.value = null
+
+        // Делегируем импорт в LongTaskRunner — он выполняется в application-scope
+        // и переживёт разрушение Activity (звонок, сворачивание).
+        // Подписка на результат уже выполнена в init {} — этот метод только стартует импорт.
+        val ctx = getApplication<Application>()
+        LongTaskRunner.startImport(ctx, uri)
+    }
+
+    // -----------------------------------------------------------------
+    // Саммаризация интервью (Default tier: NER + LexRank)
+    // -----------------------------------------------------------------
+    // (поля _summaryResult/_isGeneratingSummary/_summaryError/_exportedSummaryUri
+    //  объявлены выше — до init {} — чтобы подписки в init их видели)
+
+    /** Lazy-созданный facade. Null если модели NER не скачаны. */
+    @Volatile private var summaryFacade: SummaryFacade? = null
+    /** true если сохранённый facade — это NoOp (без NER). Тогда на следующий раз
+     *  вызова [obtainSummaryFacade] попробуем загрузить NER заново — вдруг в первый раз модели
+     *  ещё распаковывались или была временная ошибка. */
+    @Volatile private var summaryFacadeIsNoOp: Boolean = false
+
+    /**
+     * Собрать [SummaryFacade]. Если модели NER распакованы в filesDir/models/summary/ —
+     * создаётся с NER (full Default tier). Иначе без NER (только LexRank + regex).
+     *
+     * На первом вызове копирует модели из assets/summary/ в filesDir/models/summary/.
+     * Модели включены в APK (~28 МБ), поэтому интернет не нужен.
+     */
+    private fun obtainSummaryFacade(): SummaryFacade {
+        // Если уже загружен провайдер С NER — возвращаем как есть.
+        // Если сохранён именно NoOp — пробуем загрузить NER ещё раз (может быть в первый раз
+        // модели ещё распаковывались).
+        summaryFacade?.let { if (!summaryFacadeIsNoOp) return it }
+        val ctx = getApplication<Application>()
+        val summaryDir = File(ctx.filesDir, "models/summary")
+        val navecDir = File(summaryDir, "navec_news")
+        val slovnetDir = File(summaryDir, "slovnet_ner")
+        val statusFile = File(summaryDir, "ner_load_status.txt")
+
+        fun writeStatus(text: String) {
+            try {
+                summaryDir.mkdirs()
+                statusFile.writeText(
+                    "${java.text.SimpleDateFormat("HH:mm:ss").format(java.util.Date())}\n$text\n",
+                    Charsets.UTF_8,
+                )
+            } catch (_: Throwable) {}
+        }
+
+        writeStatus("START obtainSummaryFacade")
+
+        // При первом запуске модели ещё не скопированы — распаковываем из assets.
+        try {
+            ensureSummaryModelsExtracted(summaryDir)
+        } catch (e: Throwable) {
+            Log.w("InterviewVM", "Failed to extract summary models from assets", e)
+            writeStatus("EXTRACT FAILED: ${e.javaClass.simpleName}: ${e.message}\n${e.stackTraceToString().take(2000)}")
+        }
+
+        // Подробная диагностика: что лежит на диске
+        val diagBuilder = StringBuilder()
+        diagBuilder.append("navecDir=$navecDir exists=${navecDir.isDirectory}\n")
+        if (navecDir.isDirectory) {
+            navecDir.listFiles()?.forEach { f ->
+                diagBuilder.append("  ${f.name}: ${f.length()} bytes\n")
+            }
+        }
+        diagBuilder.append("slovnetDir=$slovnetDir exists=${slovnetDir.isDirectory}\n")
+        if (slovnetDir.isDirectory) {
+            slovnetDir.listFiles()?.forEach { f ->
+                if (f.isDirectory) {
+                    diagBuilder.append("  ${f.name}/ (dir)\n")
+                    f.listFiles()?.forEach { ff ->
+                        diagBuilder.append("    ${ff.name}: ${ff.length()} bytes\n")
+                    }
+                } else {
+                    diagBuilder.append("  ${f.name}: ${f.length()} bytes\n")
+                }
+            }
+        }
+        Log.i("InterviewVM", "NER models on disk:\n$diagBuilder")
+
+        val facade = if (navecDir.isDirectory && slovnetDir.isDirectory) {
+            try {
+                Log.i("InterviewVM", "Loading Slovnet NER from $navecDir + $slovnetDir")
+                writeStatus("BEFORE LOAD\n$diagBuilder")
+                val f = SummaryFacade.withSlovnet(navecDir, slovnetDir, getApplication())
+                writeStatus("LOAD OK — using Slovnet NER\n$diagBuilder")
+                summaryFacadeIsNoOp = false
+                f
+            } catch (e: Throwable) {
+                Log.w("InterviewVM", "Slovnet load failed, falling back to no-NER", e)
+                writeStatus(
+                    "LOAD FAILED: ${e.javaClass.simpleName}: ${e.message}\n\n" +
+                    "STACK:\n${e.stackTraceToString().take(3000)}\n\n" +
+                    "DISK:\n$diagBuilder"
+                )
+                summaryFacadeIsNoOp = true
+                SummaryFacade.withoutNer()
+            }
+        } else {
+            Log.i("InterviewVM", "Summary NER models not unpacked yet, using no-NER mode")
+            writeStatus("DIRS MISSING — using no-NER mode\n$diagBuilder")
+            summaryFacadeIsNoOp = true
+            SummaryFacade.withoutNer()
+        }
+        summaryFacade = facade
+        return facade
+    }
+
+    /**
+     * Копирует модели NER из assets/summary/ в filesDir/models/summary/ если их ещё нет.
+     * Критерий готовности: navec_news/pq.bin и slovnet_ner/arrays/0.bin существуют.
+     *
+     * Работает один раз на жизнь установки (или после очистки данных приложения).
+     * Размер моделей ~28 МБ — распаковка занимает ~3-5 секунд.
+     */
+    private fun ensureSummaryModelsExtracted(summaryDir: File) {
+        val pqBin = File(summaryDir, "navec_news/pq.bin")
+        val arrays0 = File(summaryDir, "slovnet_ner/arrays/0.bin")
+        if (pqBin.exists() && pqBin.length() > 1000 &&
+            arrays0.exists() && arrays0.length() > 0
+        ) {
+            Log.i("InterviewVM", "Summary models already extracted at $summaryDir")
+            return
+        }
+
+        Log.i("InterviewVM", "Extracting summary NER models from assets to $summaryDir")
+        val t0 = System.currentTimeMillis()
+        val ctx = getApplication<Application>()
+        summaryDir.mkdirs()
+        copyAssetsDir("summary/navec_news", File(summaryDir, "navec_news"))
+        copyAssetsDir("summary/slovnet_ner", File(summaryDir, "slovnet_ner"))
+        Log.i("InterviewVM", "Summary models extracted in ${System.currentTimeMillis() - t0}ms")
+    }
+
+    /**
+     * Рекурсивно копирует директорию из assets в filesystem.
+     * AssetManager.list() возвращает список содержимого (файлы + поддиректории).
+     */
+    private fun copyAssetsDir(assetPath: String, destDir: File) {
+        val ctx = getApplication<Application>()
+        val am = ctx.assets
+        val children = am.list(assetPath) ?: return
+        if (children.isEmpty()) {
+            // Это файл, не директория — копируем его как файл
+            destDir.parentFile?.mkdirs()
+            am.open(assetPath).use { inp ->
+                destDir.outputStream().use { out -> inp.copyTo(out) }
+            }
+            return
+        }
+        destDir.mkdirs()
+        for (child in children) {
+            val childAssetPath = "$assetPath/$child"
+            val childDest = File(destDir, child)
+            val grandChildren = am.list(childAssetPath)
+            if (grandChildren != null && grandChildren.isNotEmpty()) {
+                // Поддиректория — рекурсивно
+                copyAssetsDir(childAssetPath, childDest)
+            } else {
+                // Файл — копируем
+                am.open(childAssetPath).use { inp ->
+                    childDest.outputStream().use { out -> inp.copyTo(out) }
+                }
+            }
+        }
+    }
+
+    /**
+     * Сгенерировать резюме по текущему transcript (Default tier).
+     * Результат появится в [summaryResult]. На время генерации [isGeneratingSummary] = true.
+     *
+     * Работа выполняется в LongTaskRunner (application-scope) — переживёт звонок/сворачивание.
+     */
+    fun generateSummary() {
+        val transcript = _transcript.value ?: run {
+            _toast.value = "Нет распознанного текста для резюме"
+            return
+        }
+        if (LongTaskRunner.summaryInProgress.value) return
+
+        _summaryError.value = null
+        val ctx = getApplication<Application>()
+        val statusText = ctx.getString(R.string.processing_summarizing)
+        LongTaskRunner.startSummary(ctx, statusText) {
+            val plainText = transcript.segments.joinToString(" ") { it.text }
+            withContext(Dispatchers.Default) {
+                obtainSummaryFacade().summarizeDefault(plainText)
+            }
+        }
+    }
+
+    /** Сбросить текущий результат резюме (напр. при закрытии экрана). */
+    fun clearSummary() {
+        _summaryResult.value = null
+        _summaryError.value = null
+    }
+
+    /**
+     * Получить plain-text резюме для клипборда / share intent. Добавляет
+     * заголовок интервью и участников из текущих metadata/participants.
+     */
+    fun summaryToPlainText(): String? {
+        val r = _summaryResult.value ?: return null
+        val parts = _participants.value.names.values
+            .filter { it.isNotBlank() }
+            .toList()
+        return SummaryFormatter.toPlainText(
+            result = r,
+            interviewTitle = _metadata.value.title.takeIf { it.isNotBlank() },
+            participants = parts,
+        )
+    }
+
+    /**
+     * Сохранить резюме как .txt файл в Downloads/SlovamiAI/.
+     * Результат доступен в [exportedSummaryUri].
+     */
+    fun exportSummaryToTxt() {
+        val text = summaryToPlainText() ?: run {
+            _toast.value = "Нет резюме для сохранения"
+            return
+        }
+        val r = _summaryResult.value ?: return
+
+        viewModelScope.launch {
+            val uri = withContext(Dispatchers.IO) { writeSummaryTxt(text, r) }
+            if (uri == null) {
+                _toast.value = "Не удалось сохранить резюме"
+            } else {
+                _exportedSummaryUri.value = uri
+                _toast.value = "Резюме сохранено в Downloads/SlovamiAI/"
+            }
+        }
+    }
+
+    /** Низкоуровневая запись в Downloads/SlovamiAI/<filename>.txt через MediaStore.
+     *
+     * При сбое MediaStore (это бывает на MIUI/HyperOS) делает fallback на запись
+     * в app-private exports/ + FileProvider для возможности шаринга.
+     */
+    private fun writeSummaryTxt(text: String, result: SummaryResult): Uri? {
+        val ctx = getApplication<Application>()
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date(result.generatedAtMs))
+        val baseName = (_metadata.value.title.ifBlank { "Interview" })
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .take(80)
+        val fileName = "Rezume_${baseName}_$ts.txt"  // ASCII-имя, в теле название проекта
+        Log.i("InterviewVM", "writeSummaryTxt: fileName=$fileName, text=${text.length} chars")
+
+        // Сначала пробуем MediaStore (Android Q+).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val cv = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                    put(MediaStore.Downloads.RELATIVE_PATH, "Download/SlovamiAI")
+                }
+                val resolver = ctx.contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                if (uri == null) {
+                    Log.w("InterviewVM", "MediaStore.insert returned null, falling back to FileProvider")
+                } else {
+                    resolver.openOutputStream(uri)?.use { os ->
+                        os.write(text.toByteArray(Charsets.UTF_8))
+                    } ?: run {
+                        Log.w("InterviewVM", "openOutputStream returned null")
+                    }
+                    Log.i("InterviewVM", "writeSummaryTxt MediaStore OK: $uri")
+                    return uri
+                }
+            } catch (e: Exception) {
+                Log.w("InterviewVM", "MediaStore write failed, will fallback", e)
+            }
+        }
+
+        // Fallback: пытаемся записать напрямую в публичный Downloads (работает
+        // до Android 10, или если MediaStore недоступен).
+        try {
+            val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val pvDir = File(downloads, "SlovamiAI")
+            if (!pvDir.exists()) pvDir.mkdirs()
+            val outFile = File(pvDir, fileName)
+            outFile.writeText(text, Charsets.UTF_8)
+            Log.i("InterviewVM", "writeSummaryTxt public Downloads OK: ${outFile.absolutePath}")
+            return Uri.fromFile(outFile)
+        } catch (e: Exception) {
+            Log.w("InterviewVM", "public Downloads write failed, last resort: app-private", e)
+        }
+
+        // Last resort: app-private + FileProvider (всегда работает, но невидимо в проводнике).
+        return try {
+            val out = File(ctx.filesDir, "exports/$fileName")
+            out.parentFile?.mkdirs()
+            out.writeText(text, Charsets.UTF_8)
+            val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", out)
+            Log.i("InterviewVM", "writeSummaryTxt FileProvider fallback OK: ${out.absolutePath}")
+            uri
+        } catch (e: Exception) {
+            Log.e("InterviewVM", "writeSummaryTxt ALL paths failed", e)
+            null
+        }
+    }
+
+    /** Intent для шаринга резюме как plain-text (без файла). */
+    fun shareSummaryAsTextIntent(): Intent? {
+        val text = summaryToPlainText() ?: return null
+        val title = _metadata.value.title.ifBlank { "Резюме интервью" }
+        return Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Резюме: $title")
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+    }
+
+    /** Intent для шаринга сохранённого .txt файла. */
+    fun shareSummaryTxtIntent(uri: Uri): Intent {
+        return Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
+    /**
+     * Скопировать резюме в системный буфер обмена через нативный Android API
+     * (не Compose обёртку). Это важно потому что Compose ClipboardManager.setText()
+     * в некоторых версиях обрезает длинные строки. Нативный клипборд Android не имеет
+     * такого лимита.
+     *
+     * Вызывает toast внутри себя — вызывающий код просто вызывает без дополнений.
+     */
+    fun copySummaryToClipboard() {
+        val text = summaryToPlainText() ?: run {
+            _toast.value = "Нет резюме для копирования"
+            return
+        }
+        try {
+            val ctx = getApplication<Application>()
+            val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            val clip = android.content.ClipData.newPlainText("Резюме интервью", text)
+            clipboard.setPrimaryClip(clip)
+            Log.i("InterviewVM", "Summary copied to clipboard: ${text.length} chars")
+            _toast.value = "Резюме скопировано (${text.length} симв.)"
+        } catch (e: Exception) {
+            Log.e("InterviewVM", "Clipboard copy failed", e)
+            _toast.value = "Не удалось скопировать: ${e.message}"
+        }
+    }
+
+
+    // -----------------------------------------------------------------
+    // Запись
+    // -----------------------------------------------------------------
+
+    fun startRecording() {
+        if (!recorder.hasPermission()) {
+            _toast.value = getApplication<Application>().getString(R.string.toast_no_microphone_permission)
+            return
+        }
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date())
+        val out = File(getApplication<Application>().filesDir, "recordings/interview_$ts.wav")
+        if (recorder.start(out)) {
+            _wavFile.value = out
+            _phase.value = Phase.RECORDING
+        } else {
+            _phase.value = Phase.ERROR
+            _toast.value = recorder.errorMessage.value ?: getApplication<Application>().getString(R.string.toast_record_start_failed)
+        }
+    }
+
+    fun pauseRecording() {
+        recorder.pause()
+        _phase.value = Phase.PAUSED
+    }
+
+    fun resumeRecording() {
+        recorder.resume()
+        _phase.value = Phase.RECORDING
+    }
+
+    fun stopRecording() {
+        val file = recorder.stop()
+        if (file != null) {
+            _wavFile.value = file
+            _phase.value = Phase.RECORDED
+        } else {
+            _phase.value = Phase.ERROR
+            _toast.value = getApplication<Application>().getString(R.string.toast_record_save_failed)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Распознавание
+    // -----------------------------------------------------------------
+
+    fun runRecognition() {
+        val wav = _wavFile.value ?: return
+        // Перед новым распознаванием сбрасываем резюме и docx-uri от предыдущего прогона —
+        // иначе после «Сделать резюме» пользователь будет видеть старый результат.
+        _summaryResult.value = null
+        _summaryError.value = null
+        _exportedSummaryUri.value = null
+        _exportedDocx.value = null
+        // Разветвление по языку: RU идёт в родной пайплайн (GigaAM + diarization),
+        // EN — в Whisper-обёртку (single-speaker в версии 1.0; multi-speaker будет в Шаге 3).
+        when (_asrLanguage.value) {
+            AsrLanguage.RU -> runRussianRecognition(wav)
+            AsrLanguage.EN -> runEnglishRecognition(wav)
+        }
+    }
+
+    private fun runRussianRecognition(wav: File) {
+        val ctx = getApplication<Application>()
+        if (LongTaskRunner.recognitionInProgress.value) return
+        _phase.value = Phase.PROCESSING
+        val statusText = ctx.getString(R.string.processing_recognizing)
+        // Работа выполняется в LongTaskRunner (application-scope) — переживёт звонок/сворачивание.
+        // Подписка на результат уже выполнена в init {}.
+        LongTaskRunner.startRecognition(ctx, statusText) { _ ->
+            // initialize() идемпотентен — если уже загружено, вернёт сразу.
+            if (!asr.initialize(_embeddingModel.value)) {
+                return@startRecognition LongTaskRunner.RecognitionOutcome(
+                    transcript = null, wavFile = wav,
+                    error = asr.errorMessage.value ?: ctx.getString(R.string.toast_models_load_failed),
+                )
+            }
+            val result = if (LongAudioProcessor.shouldSplit(wav)) {
+                LongAudioProcessor.processLong(
+                    asr = asr,
+                    wavFile = wav,
+                    speakerMode = _speakerCountMode.value,
+                    onChunkProgress = { idx, total ->
+                        Log.i("InterviewVM", "Processing chunk ${idx + 1}/$total")
+                    },
+                )
+            } else {
+                asr.process(wav, speakerMode = _speakerCountMode.value)
+            }
+            if (result == null) {
+                LongTaskRunner.RecognitionOutcome(
+                    transcript = null, wavFile = wav,
+                    error = asr.errorMessage.value ?: ctx.getString(R.string.toast_recognize_failed),
+                )
+            } else {
+                LongTaskRunner.RecognitionOutcome(
+                    transcript = result, wavFile = wav, error = null,
+                )
+            }
+        }
+    }
+
+    /**
+     * EN-ветка распознавания — Whisper base.en + диаризация.
+     *
+     * Пайплайн:
+     *   1. Читаем WAV в FloatArray
+     *   2. Диаризация (language-agnostic) через основной AsrService → сегменты [start, end, speakerId]
+     *   3. Для каждого сегмента — Whisper.transcribe()
+     *   4. Сливаем в InterviewTranscript с правильными speakerId и timestamps
+     *
+     * Whisper имеет лимит ~30 сек на инференцию. Диаризация обычно даёт сегменты короче
+     * 30 сек, но если кто-то говорит без пауз дольше — добавляем sub-чанкинг.
+     */
+    private fun runEnglishRecognition(wav: File) {
+        val ctx = getApplication<Application>()
+        if (LongTaskRunner.recognitionInProgress.value) return
+
+        // Предварительная проверка моделей — быстро и не требует сервиса.
+        if (!isAsrLanguageReady(ctx, AsrLanguage.EN)) {
+            _phase.value = Phase.ERROR
+            _toast.value = "Английские модели не скачаны. Откройте «О программе» и скачайте."
+            return
+        }
+
+        _phase.value = Phase.PROCESSING
+        val statusText = ctx.getString(R.string.processing_recognizing)
+        // Оборачиваем всю работу в LongTaskRunner — переживёт звонок/сворачивание.
+        // Подписка на recognitionResult в init {} переключит _transcript/_phase.
+        LongTaskRunner.startRecognition(ctx, statusText) { _ ->
+            // Инициализируем основной AsrService — он даёт diarization
+            if (!asr.initialize(_embeddingModel.value)) {
+                return@startRecognition LongTaskRunner.RecognitionOutcome(
+                    transcript = null, wavFile = wav,
+                    error = "Не удалось загрузить модели диаризации.",
+                )
+            }
+            val enAsrSvc = ensureEnAsr(ctx)
+                ?: return@startRecognition LongTaskRunner.RecognitionOutcome(
+                    transcript = null, wavFile = wav,
+                    error = "Не удалось инициализировать Whisper.",
+                )
+
+            val procT0 = System.currentTimeMillis()
+            // === Шаг 1: Читаем WAV ===
+            asr.setExternalState(AsrService.State.LOADING_MODELS, ctx.getString(R.string.asr_reading_wav), 0f)
+            val samples = withContext(Dispatchers.IO) { asr.readWavSamples(wav) }
+            if (samples == null || samples.isEmpty()) {
+                return@startRecognition LongTaskRunner.RecognitionOutcome(
+                    transcript = null, wavFile = wav, error = "Не удалось прочитать запись.",
+                )
+            }
+            val totalDurationMs = (samples.size * 1000L) / 16_000L
+            asr.setExternalState(AsrService.State.LOADING_MODELS, "", 0.05f)
+
+            // === Шаг 2: Диаризация (если Single — пропускаем) ===
+            val mode = _speakerCountMode.value
+            val diarSegs: List<AsrService.DiarizationSegment> = if (mode is SpeakerCountMode.Single) {
+                listOf(AsrService.DiarizationSegment(0f, totalDurationMs / 1000f, 0))
+            } else {
+                asr.setExternalState(AsrService.State.DIARIZING, ctx.getString(R.string.asr_status_diarizing), 0.1f)
+                val segs = asr.diarizeOnly(samples, mode)
+                    ?: return@startRecognition LongTaskRunner.RecognitionOutcome(
+                        transcript = null, wavFile = wav, error = "Ошибка диаризации.",
+                    )
+                if (segs.isEmpty()) {
+                    listOf(AsrService.DiarizationSegment(0f, totalDurationMs / 1000f, 0))
+                } else segs
+            }
+            asr.setExternalState(AsrService.State.TRANSCRIBING, ctx.getString(R.string.asr_status_recognizing), 0.4f)
+
+            // === Шаг 3: Whisper на каждом сегменте ===
+            val WHISPER_CHUNK_SEC = 25
+            val chunkSize = WHISPER_CHUNK_SEC * 16_000
+            val resultSegments = mutableListOf<TranscriptSegment>()
+
+            for ((idx, ds) in diarSegs.withIndex()) {
+                val startSample = (ds.start * 16_000f).toInt().coerceAtLeast(0)
+                val endSample = (ds.end * 16_000f).toInt().coerceAtMost(samples.size)
+                if (endSample <= startSample) continue
+                if (endSample - startSample < 16_000 * 0.2f) continue
+
+                val segSamples = samples.copyOfRange(startSample, endSample)
+                val startMs = (ds.start * 1000f).toLong()
+                val endMs = (ds.end * 1000f).toLong()
+
+                asr.setExternalState(
+                    AsrService.State.TRANSCRIBING,
+                    ctx.getString(R.string.asr_status_segment_progress, idx + 1, diarSegs.size),
+                    0.4f + (idx + 1).toFloat() / diarSegs.size * 0.6f,
+                )
+
+                val segText = if (segSamples.size <= chunkSize) {
+                    enAsrSvc.transcribe(segSamples, sampleRate = 16_000) ?: ""
+                } else {
+                    val parts = mutableListOf<String>()
+                    var off = 0
+                    while (off < segSamples.size) {
+                        val e = (off + chunkSize).coerceAtMost(segSamples.size)
+                        val chunk = segSamples.copyOfRange(off, e)
+                        val t = enAsrSvc.transcribe(chunk, sampleRate = 16_000)
+                        if (!t.isNullOrBlank()) parts.add(t.trim())
+                        off = e
+                    }
+                    parts.joinToString(" ")
+                }
+
+                val cleanText = segText.trim()
+                if (cleanText.isBlank()) continue
+
+                val words = cleanText.split(Regex("\\s+")).filter { it.isNotBlank() }
+                val perWordMs = if (words.isEmpty()) 0L else (endMs - startMs) / words.size.coerceAtLeast(1)
+                val transcriptWords = mutableListOf<app.slovami.ai.asr.TranscriptWord>()
+                var cursor = startMs
+                for (w in words) {
+                    val confidence = when {
+                        w.length >= 5 -> 0.92f
+                        w.length >= 3 -> 0.78f
+                        w.length >= 2 -> 0.65f
+                        else          -> 0.45f
+                    }
+                    transcriptWords.add(app.slovami.ai.asr.TranscriptWord(
+                        text = w, startMs = cursor, endMs = cursor + perWordMs, confidence = confidence,
+                    ))
+                    cursor += perWordMs
+                }
+                resultSegments.add(TranscriptSegment(
+                    speakerId = ds.speaker, startMs = startMs, endMs = endMs, words = transcriptWords,
+                ))
+            }
+
+            if (resultSegments.isEmpty()) {
+                return@startRecognition LongTaskRunner.RecognitionOutcome(
+                    transcript = null, wavFile = wav,
+                    error = "Whisper вернул пустой результат. Возможно в записи нет речи.",
+                )
+            }
+
+            val numSpeakers = resultSegments.map { it.speakerId }.distinct().size
+            val totalMs = System.currentTimeMillis() - procT0
+            Log.i("InterviewVM", "PERF EN: audio=${totalDurationMs}ms wall=${totalMs}ms speakers=$numSpeakers segments=${resultSegments.size}")
+
+            val result = app.slovami.ai.asr.InterviewTranscript(
+                segments = resultSegments,
+                totalDurationMs = totalDurationMs,
+                recordedAt = System.currentTimeMillis(),
+                sourceWavPath = wav.absolutePath,
+                numSpeakers = numSpeakers,
+            )
+            asr.setExternalState(AsrService.State.DONE, ctx.getString(R.string.asr_status_done), 1f)
+
+            LongTaskRunner.RecognitionOutcome(
+                transcript = result, wavFile = wav, error = null,
+            )
+        }
+    }
+
+    /**
+     * Фоновая конвертация исходного WAV в M4A для экономии места.
+     * При успехе WAV удаляется, _m4aFile получает путь к M4A.
+     * При ошибке WAV остаётся как fallback.
+     */
+    private fun compressWavToM4aInBackground(wav: File) {
+        viewModelScope.launch {
+            _isCompressing.value = true
+            val m4a = File(wav.parentFile, wav.nameWithoutExtension + ".m4a")
+            val result = Mp4Encoder.encode(wav, m4a)
+            if (result != null && result.exists() && result.length() > 0) {
+                _m4aFile.value = result
+                // WAV больше не нужен — резко экономим диск (115 МБ за час → ~10 МБ)
+                try { wav.delete() } catch (_: Throwable) {}
+                _wavFile.value = null
+                // Если плеер был загружен на WAV — перезагружаем на M4A
+                if (!player.isPlaying.value) {
+                    player.loadFromFile(result)
+                }
+                // Пересохраняем сессию с уже сжатым аудио
+                saveCurrentSession()
+            }
+            // При ошибке конвертации оставляем WAV. _m4aFile остаётся null,
+            // экспорт при этом копирования аудио (шаг 2) возьмёт WAV.
+            _isCompressing.value = false
+        }
+    }
+
+    /**
+     * Сохранить текущую сессию в историю (JSON). Не блокирует.
+     * Вызывается автоматически после распознавания и после конвертации в M4A,
+     * а также при изменении имён участников / метаданных (через setParticipantName и updateMetadata).
+     */
+    private fun saveCurrentSession() {
+        val transcript = _transcript.value ?: return
+        val id = _currentSessionId.value ?: return
+        val audio = _m4aFile.value ?: _wavFile.value
+        viewModelScope.launch(Dispatchers.IO) {
+            SessionStore.save(
+                ctx = getApplication(),
+                id = id,
+                metadata = _metadata.value,
+                participants = _participants.value,
+                transcript = transcript,
+                audioFile = audio,
+            )
+        }
+    }
+
+    /**
+     * Загружает сессию из истории и ставит в текущий ViewModel.
+     * Фаза → READY. Пользователь может редактировать и переэкспортировать.
+     */
+    fun loadFromHistory(id: String) {
+        viewModelScope.launch {
+            val loaded = withContext(Dispatchers.IO) {
+                SessionStore.load(getApplication(), id)
+            }
+            if (loaded == null) {
+                _toast.value = getApplication<Application>().getString(R.string.toast_session_load_failed)
+                return@launch
+            }
+            // Сбрасываем текущий плеер перед загрузкой нового файла
+            player.stop()
+            player.release()
+
+            _currentSessionId.value = loaded.id
+            _metadata.value = loaded.metadata
+            _participants.value = loaded.participants
+            _transcript.value = loaded.transcript
+            // Сбрасываем резюме при загрузке другой сессии — резюме было от предыдущей записи.
+            _summaryResult.value = null
+            _summaryError.value = null
+            _exportedSummaryUri.value = null
+            _exportedDocx.value = null
+            // Аудио: выставляем либо M4A либо WAV в соответствующий StateFlow,
+            // чтобы hasAudio() / ensurePlayerLoaded() работали.
+            val audio = loaded.audioFile
+            if (audio != null) {
+                if (audio.extension.equals("m4a", ignoreCase = true)) {
+                    _m4aFile.value = audio
+                    _wavFile.value = null
+                } else {
+                    _wavFile.value = audio
+                    _m4aFile.value = null
+                }
+            } else {
+                _m4aFile.value = null
+                _wavFile.value = null
+            }
+            _exportedDocx.value = null
+            _phase.value = Phase.READY
+            if (audio == null) {
+                _toast.value = getApplication<Application>().getString(R.string.toast_audio_missing)
+            }
+        }
+    }
+
+    /**
+     * Убрать текущую сессию из истории (JSON + аудио).
+     * После вызова сессия в ViewModel сбрасывается.
+     */
+    fun removeCurrentFromHistory() {
+        val id = _currentSessionId.value ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = SessionStore.delete(getApplication(), id)
+            withContext(Dispatchers.Main) {
+                if (ok) {
+                    _toast.value = getApplication<Application>().getString(R.string.toast_session_deleted)
+                    resetSession()
+                } else {
+                    _toast.value = getApplication<Application>().getString(R.string.toast_session_delete_failed)
+                }
+            }
+        }
+    }
+
+    /**
+     * Загружает аудио в плеер. Приоритет M4A > WAV.
+     * Нужно вызвать перед первым вызовом playSegment/play.
+     * Идемпотентен — безопасно вызывать повторно.
+     */
+    fun ensurePlayerLoaded(): Boolean {
+        val src = _m4aFile.value ?: _wavFile.value ?: return false
+        return player.loadFromFile(src)
+    }
+
+    /** Проиграть один сегмент и остановиться на его конце. */
+    fun playSegment(startMs: Long, endMs: Long) {
+        if (!ensurePlayerLoaded()) {
+            _toast.value = getApplication<Application>().getString(R.string.toast_audio_unavailable)
+            return
+        }
+        player.playSegment(startMs, endMs)
+    }
+
+    /** Play/Pause для глобального мини-плеера. */
+    fun togglePlayer() {
+        if (!ensurePlayerLoaded()) {
+            _toast.value = getApplication<Application>().getString(R.string.toast_audio_unavailable)
+            return
+        }
+        player.toggle()
+    }
+
+    fun seekPlayer(ms: Long) {
+        if (ensurePlayerLoaded()) player.seekTo(ms)
+    }
+
+    /** true если хоть какой-то аудио-файл живой и можно играть. */
+    fun hasAudio(): Boolean = (_m4aFile.value ?: _wavFile.value) != null
+
+    // -----------------------------------------------------------------
+    // Метаданные / участники
+    // -----------------------------------------------------------------
+
+    fun updateMetadata(update: (InterviewMetadata) -> InterviewMetadata) {
+        _metadata.value = update(_metadata.value)
+        // Если сессия уже в истории — пересохраняем
+        if (_currentSessionId.value != null) saveCurrentSession()
+    }
+
+    fun setParticipantName(speakerId: Int, name: String) {
+        val map = _participants.value.names.toMutableMap()
+        if (name.isBlank()) map.remove(speakerId) else map[speakerId] = name.trim()
+        _participants.value = Participants(map)
+        if (_currentSessionId.value != null) saveCurrentSession()
+    }
+
+    /** Список идентификаторов спикеров для редактора. До распознавания — пусто.
+     *  После — реальные id из transcript. */
+    fun knownSpeakerIds(): List<Int> {
+        val t = _transcript.value ?: return _participants.value.names.keys.sorted()
+        return t.segments.map { it.speakerId }.distinct().sorted()
+    }
+
+    // -----------------------------------------------------------------
+    // Экспорт DOCX
+    // -----------------------------------------------------------------
+
+    /**
+     * Сохранить DOCX + аудио в Downloads/MK-Интервью/.  Возвращает URI для шаринга.
+     * Аудио копируется предпочтительно M4A (если конвертация уже закончилась),
+     * иначе fallback на исходный WAV.
+     */
+    fun exportDocx() {
+        val t = _transcript.value ?: return
+        viewModelScope.launch {
+            val uri = withContext(Dispatchers.IO) { writeDocx(t) }
+            if (uri == null) {
+                _toast.value = getApplication<Application>().getString(R.string.toast_docx_save_failed)
+                return@launch
+            }
+            _exportedDocx.value = uri
+
+            // Копируем аудио-файл рядом с DOCX. Приоритет M4A > WAV.
+            val audioSrc = _m4aFile.value ?: _wavFile.value
+            val audioCopied = if (audioSrc != null) {
+                withContext(Dispatchers.IO) { copyAudioToDownloads(audioSrc) }
+            } else null
+
+            _toast.value = when {
+                audioCopied != null -> getApplication<Application>().getString(R.string.toast_export_done_with_audio)
+                _isCompressing.value -> getApplication<Application>().getString(R.string.toast_export_done_compressing)
+                else -> getApplication<Application>().getString(R.string.toast_export_done)
+            }
+        }
+    }
+
+    /**
+     * Копирует аудио в Downloads/MK-Интервью/. Имя файла — то же что у DOCX,
+     * только расширение соответствует исходнику (.m4a / .wav).
+     */
+    private fun copyAudioToDownloads(audioSrc: File): Uri? {
+        if (!audioSrc.exists() || audioSrc.length() == 0L) return null
+        val ctx = getApplication<Application>()
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date(audioSrc.lastModified()))
+        val baseName = (_metadata.value.title.ifBlank { "Interview" })
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .take(80)
+        val ext = audioSrc.extension.lowercase().ifBlank { "m4a" }
+        val fileName = "${baseName}_$ts.$ext"
+        val mime = when (ext) {
+            "m4a", "mp4", "aac" -> "audio/mp4"
+            "wav"               -> "audio/wav"
+            else                -> "audio/*"
+        }
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val cv = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, mime)
+                    put(MediaStore.Downloads.RELATIVE_PATH, "Download/SlovamiAI")
+                }
+                val resolver = ctx.contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                    ?: return null
+                resolver.openOutputStream(uri)?.use { os ->
+                    audioSrc.inputStream().use { it.copyTo(os) }
+                }
+                uri
+            } else {
+                val out = File(ctx.filesDir, "exports/$fileName")
+                out.parentFile?.mkdirs()
+                audioSrc.inputStream().use { src -> out.outputStream().use { src.copyTo(it) } }
+                FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", out)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("InterviewViewModel", "copyAudioToDownloads failed", e)
+            null
+        }
+    }
+
+    private fun writeDocx(t: InterviewTranscript): Uri? {
+        val ctx = getApplication<Application>()
+        val builder = DocxBuilder(t, _metadata.value, _participants.value)
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date())
+        val baseName = (_metadata.value.title.ifBlank { "Interview" })
+            .replace(Regex("[\\\\/:*?\"<>|]"), "_")
+            .take(80)
+        val fileName = "${baseName}_$ts.docx"
+
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // MediaStore Downloads — современный путь для Android 10+
+                val cv = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(
+                        MediaStore.Downloads.MIME_TYPE,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                    put(MediaStore.Downloads.RELATIVE_PATH, "Download/SlovamiAI")
+                }
+                val resolver = ctx.contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                    ?: return null
+                resolver.openOutputStream(uri)?.use { os -> builder.writeTo(os) }
+                uri
+            } else {
+                // Fallback — пишем в app-private + FileProvider
+                val out = File(ctx.filesDir, "exports/$fileName")
+                out.parentFile?.mkdirs()
+                builder.writeTo(out)
+                FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", out)
+            }
+        } catch (e: Exception) {
+            _toast.value = getApplication<Application>().getString(R.string.toast_docx_save_error, e.message ?: "")
+            null
+        }
+    }
+
+    /** Intent для шаринга последнего экспортированного DOCX. */
+    fun shareDocxIntent(uri: Uri): Intent {
+        return Intent(Intent.ACTION_SEND).apply {
+            type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
+    // -----------------------------------------------------------------
+
+    fun consumeToast() { _toast.value = null }
+
+    /** Показать toast из UI-кода (например после clipboard copy). */
+    fun showToast(message: String) {
+        _toast.value = message
+    }
+
+    fun resetSession() {
+        player.stop()
+        player.release()
+        _transcript.value = null
+        _wavFile.value = null
+        _m4aFile.value = null
+        _exportedDocx.value = null
+        _summaryResult.value = null
+        _summaryError.value = null
+        _exportedSummaryUri.value = null
+        _currentSessionId.value = null
+        _phase.value = Phase.IDLE
+    }
+
+    fun deleteAllModelsAndRestart(ctx: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val storage = ModelStorage(ctx)
+            storage.deleteAll()
+            // Взводим флаг force_downloader — это заставит isFirstRunComplete пропустить
+            // assets fallback при следующем старте Activity. Без этого модели сразу же
+            // скопируются из APK assets обратно в filesDir, и Downloader не покажется.
+            storage.setForceDownloaderFlag()
+            // И рестарт Activity — это заставит MainActivity заново проверить
+            // ModelStorage.isFirstRunComplete() → false → покажет Downloader
+            withContext(Dispatchers.Main) {
+                _toast.value = ctx.getString(R.string.toast_models_deleted)
+                // Простейший рестарт — перезапускаем MainActivity через Intent
+                val intent = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
+                intent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+                if (intent != null) ctx.startActivity(intent)
+            }
+        }
+    }
+
+    override fun onCleared() {
+        recorder.release()
+        asr.release()
+        player.release()
+        try { enAsr?.release() } catch (_: Throwable) {}
+        enAsr = null
+        super.onCleared()
+    }
+
+    /** Прочитать WAV (16kHz mono PCM16) с диска в FloatArray. */
+    private fun readWavFromFile(file: File): FloatArray? {
+        return try {
+            val bytes = file.readBytes()
+            if (bytes.size < 44) return null
+            val data = bytes.copyOfRange(44, bytes.size)
+            val numSamples = data.size / 2
+            val out = FloatArray(numSamples)
+            val bb = java.nio.ByteBuffer.wrap(data).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            for (i in 0 until numSamples) {
+                out[i] = bb.short.toFloat() / 32768f
+            }
+            out
+        } catch (e: Throwable) {
+            android.util.Log.e("InterviewViewModel", "readWavFromFile failed", e)
+            null
+        }
+    }
+
+    // =============================
+}
+
+

@@ -6,7 +6,7 @@
       На Android 11 и ниже splash будет дефолтным (системная заглушка),
       на Android 12+ — наш брендированный.
     -->
-    <style name="Theme.ProtocolVoice" parent="Theme.SplashScreen">
+    <style name="Theme.SlovamiAI" parent="Theme.SplashScreen">
         <!-- Цвет фона splash экрана — наш тёмный navy (соответствует иконке) -->
         <item name="windowSplashScreenBackground">@color/ic_launcher_background</item>
 
@@ -19,11 +19,11 @@
         <item name="windowSplashScreenAnimationDuration">200</item>
 
         <!-- Тема в которую переключаемся ПОСЛЕ splash (наш обычный UI) -->
-        <item name="postSplashScreenTheme">@style/Theme.ProtocolVoice.NoSplash</item>
+        <item name="postSplashScreenTheme">@style/Theme.SlovamiAI.NoSplash</item>
     </style>
 
     <!-- Основная тема UI (без splash). Используется в Activity.theme -->
-    <style name="Theme.ProtocolVoice.NoSplash" parent="Theme.AppCompat.DayNight.NoActionBar">
+    <style name="Theme.SlovamiAI.NoSplash" parent="Theme.AppCompat.DayNight.NoActionBar">
         <!-- AppCompat DayNight NoActionBar — требуется для AppCompatActivity
              (который нужен для AppCompatDelegate.setApplicationLocales — смены языка UI).
              Compose рисует всё своё визуально — AppCompat-стили не перекрываются. -->
